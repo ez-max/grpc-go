@@ -44,7 +44,6 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
-	"google.golang.org/grpc/serviceconfig"
 	"google.golang.org/grpc/status"
 	testpb "google.golang.org/grpc/test/grpc_testing"
 )
@@ -249,7 +248,7 @@ func (b *remoteBalancer) BalanceLoad(stream lbgrpc.LoadBalancer_BalanceLoadServe
 }
 
 type testServer struct {
-	testpb.TestServiceServer
+	testpb.UnimplementedTestServiceServer
 
 	addr     string
 	fallback bool
@@ -853,12 +852,6 @@ func TestFallback(t *testing.T) {
 }
 
 func TestGRPCLBPickFirst(t *testing.T) {
-	const pfc = `{"loadBalancingConfig":[{"grpclb":{"childPolicy":[{"pick_first":{}}]}}]}`
-	svcCfg, err := serviceconfig.Parse(pfc)
-	if err != nil {
-		t.Fatalf("Error parsing config %q: %v", pfc, err)
-	}
-
 	defer leakcheck.Check(t)
 
 	r, cleanup := manual.GenerateAndRegisterManualResolver()
@@ -908,6 +901,11 @@ func TestGRPCLBPickFirst(t *testing.T) {
 	tss.ls.sls <- &lbpb.ServerList{Servers: beServers[0:3]}
 
 	// Start with sub policy pick_first.
+	const pfc = `{"loadBalancingConfig":[{"grpclb":{"childPolicy":[{"pick_first":{}}]}}]}`
+	scpr := r.CC.ParseServiceConfig(pfc)
+	if scpr.Err != nil {
+		t.Fatalf("Error parsing config %q: %v", pfc, scpr.Err)
+	}
 
 	r.UpdateState(resolver.State{
 		Addresses: []resolver.Address{{
@@ -915,7 +913,7 @@ func TestGRPCLBPickFirst(t *testing.T) {
 			Type:       resolver.GRPCLB,
 			ServerName: lbServerName,
 		}},
-		ServiceConfig: svcCfg,
+		ServiceConfig: scpr,
 	})
 
 	result = ""
@@ -954,9 +952,9 @@ func TestGRPCLBPickFirst(t *testing.T) {
 	}
 
 	// Switch sub policy to roundrobin.
-	grpclbServiceConfigEmpty, err := serviceconfig.Parse(`{}`)
-	if err != nil {
-		t.Fatalf("Error parsing config %q: %v", grpclbServiceConfigEmpty, err)
+	grpclbServiceConfigEmpty := r.CC.ParseServiceConfig(`{}`)
+	if grpclbServiceConfigEmpty.Err != nil {
+		t.Fatalf("Error parsing config %q: %v", `{}`, grpclbServiceConfigEmpty.Err)
 	}
 
 	r.UpdateState(resolver.State{
@@ -1125,9 +1123,9 @@ func TestGRPCLBStatsUnaryFailedToSend(t *testing.T) {
 	})
 
 	if err := checkStats(stats, &rpcStats{
-		numCallsStarted:                        int64(countRPC),
-		numCallsFinished:                       int64(countRPC),
-		numCallsFinishedWithClientFailedToSend: int64(countRPC - 1),
+		numCallsStarted:                        int64(countRPC)*2 - 1,
+		numCallsFinished:                       int64(countRPC)*2 - 1,
+		numCallsFinishedWithClientFailedToSend: int64(countRPC-1) * 2,
 		numCallsFinishedKnownReceived:          1,
 	}); err != nil {
 		t.Fatal(err)
@@ -1227,9 +1225,9 @@ func TestGRPCLBStatsStreamingFailedToSend(t *testing.T) {
 	})
 
 	if err := checkStats(stats, &rpcStats{
-		numCallsStarted:                        int64(countRPC),
-		numCallsFinished:                       int64(countRPC),
-		numCallsFinishedWithClientFailedToSend: int64(countRPC - 1),
+		numCallsStarted:                        int64(countRPC)*2 - 1,
+		numCallsFinished:                       int64(countRPC)*2 - 1,
+		numCallsFinishedWithClientFailedToSend: int64(countRPC-1) * 2,
 		numCallsFinishedKnownReceived:          1,
 	}); err != nil {
 		t.Fatal(err)

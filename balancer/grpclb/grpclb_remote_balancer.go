@@ -23,10 +23,11 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"reflect"
 	"time"
 
+	"github.com/golang/protobuf/proto"
 	timestamppb "github.com/golang/protobuf/ptypes/timestamp"
+	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/balancer"
 	lbpb "google.golang.org/grpc/balancer/grpclb/grpc_lb_v1"
@@ -34,6 +35,7 @@ import (
 	"google.golang.org/grpc/grpclog"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/channelz"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/resolver"
 )
@@ -52,7 +54,7 @@ func (lb *lbBalancer) processServerList(l *lbpb.ServerList) {
 	lb.serverListReceived = true
 
 	// If the new server list == old server list, do nothing.
-	if reflect.DeepEqual(lb.fullServerList, l.Servers) {
+	if cmp.Equal(lb.fullServerList, l.Servers, cmp.Comparer(proto.Equal)) {
 		if grpclog.V(2) {
 			grpclog.Infof("lbBalancer: new serverlist same as the previous one, ignoring")
 		}
@@ -66,7 +68,7 @@ func (lb *lbBalancer) processServerList(l *lbpb.ServerList) {
 			continue
 		}
 
-		md := metadata.Pairs(lbTokeyKey, s.LoadBalanceToken)
+		md := metadata.Pairs(lbTokenKey, s.LoadBalanceToken)
 		ip := net.IP(s.IpAddress)
 		ipStr := ip.String()
 		if ip.To4() == nil {
@@ -348,6 +350,13 @@ func (lb *lbBalancer) dialRemoteLB(remoteLBName string) {
 	if channelz.IsOn() {
 		dopts = append(dopts, grpc.WithChannelzParentID(lb.opt.ChannelzParentID))
 	}
+
+	// Enable Keepalive for grpclb client.
+	dopts = append(dopts, grpc.WithKeepaliveParams(keepalive.ClientParameters{
+		Time:                20 * time.Second,
+		Timeout:             10 * time.Second,
+		PermitWithoutStream: true,
+	}))
 
 	// DialContext using manualResolver.Scheme, which is a random scheme
 	// generated when init grpclb. The target scheme here is not important.
