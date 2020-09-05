@@ -35,6 +35,7 @@ import (
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/channelz"
+	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 	"google.golang.org/grpc/status"
@@ -115,7 +116,7 @@ func (s *testHealthServer) SetServingStatus(service string, status healthpb.Heal
 func setupHealthCheckWrapper() (hcEnterChan chan struct{}, hcExitChan chan struct{}, wrapper internal.HealthChecker) {
 	hcEnterChan = make(chan struct{})
 	hcExitChan = make(chan struct{})
-	wrapper = func(ctx context.Context, newStream func(string) (interface{}, error), update func(state connectivity.State), service string) error {
+	wrapper = func(ctx context.Context, newStream func(string) (interface{}, error), update func(connectivity.State, error), service string) error {
 		close(hcEnterChan)
 		defer close(hcExitChan)
 		return testHealthCheckFunc(ctx, newStream, update, service)
@@ -139,7 +140,7 @@ func setupServer(sc *svrConfig) (s *grpc.Server, lis net.Listener, ts *testHealt
 		ts = newTestHealthServer()
 	}
 	healthgrpc.RegisterHealthServer(s, ts)
-	testpb.RegisterTestServiceServer(s, &testServer{})
+	testpb.RegisterTestServiceService(s, testpb.NewTestServiceService(&testServer{}))
 	go s.Serve(lis)
 	return s, lis, ts, s.Stop, nil
 }
@@ -151,19 +152,19 @@ type clientConfig struct {
 }
 
 func setupClient(c *clientConfig) (cc *grpc.ClientConn, r *manual.Resolver, deferFunc func(), err error) {
-	r, rcleanup := manual.GenerateAndRegisterManualResolver()
+	r = manual.NewBuilderWithScheme("whatever")
 	var opts []grpc.DialOption
-	opts = append(opts, grpc.WithInsecure(), grpc.WithBalancerName(c.balancerName))
+	opts = append(opts, grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(c.balancerName))
 	if c.testHealthCheckFuncWrapper != nil {
 		opts = append(opts, internal.WithHealthCheckFunc.(func(internal.HealthChecker) grpc.DialOption)(c.testHealthCheckFuncWrapper))
 	}
 	opts = append(opts, c.extraDialOption...)
 	cc, err = grpc.Dial(r.Scheme()+":///test.server", opts...)
 	if err != nil {
-		rcleanup()
+
 		return nil, nil, nil, fmt.Errorf("dial failed due to err: %v", err)
 	}
-	return cc, r, func() { cc.Close(); rcleanup() }, nil
+	return cc, r, func() { cc.Close() }, nil
 }
 
 func (s) TestHealthCheckWatchStateChange(t *testing.T) {
@@ -247,6 +248,7 @@ func (s) TestHealthCheckWatchStateChange(t *testing.T) {
 
 // If Watch returns Unimplemented, then the ClientConn should go into READY state.
 func (s) TestHealthCheckHealthServerNotRegistered(t *testing.T) {
+	grpctest.TLogger.ExpectError("Subchannel health check is unimplemented at server side, thus health check is disabled")
 	s := grpc.NewServer()
 	lis, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
@@ -507,7 +509,7 @@ func (s) TestHealthCheckWithAddrConnDrain(t *testing.T) {
 	default:
 	}
 	// trigger teardown of the ac
-	r.UpdateState(resolver.State{Addresses: []resolver.Address{}, ServiceConfig: sc})
+	r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: "fake address"}}, ServiceConfig: sc})
 
 	select {
 	case <-hcExitChan:
@@ -653,7 +655,7 @@ func (s) TestHealthCheckWithoutSetConnectivityStateCalledAddrConnShutDown(t *tes
 		t.Fatal("Health check function has not been invoked after 5s.")
 	}
 	// trigger teardown of the ac, ac in SHUTDOWN state
-	r.UpdateState(resolver.State{Addresses: []resolver.Address{}, ServiceConfig: sc})
+	r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: "fake address"}}, ServiceConfig: sc})
 
 	// The health check func should exit without calling the setConnectivityState func, as server hasn't sent
 	// any response.

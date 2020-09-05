@@ -82,15 +82,17 @@ var (
 		fmt.Sprintf("Compression mode - One of: %v", strings.Join(allCompModes, ", ")), allCompModes)
 	networkMode = flags.StringWithAllowedValues("networkMode", networkModeNone,
 		"Network mode includes LAN, WAN, Local and Longhaul", allNetworkModes)
-	readLatency        = flags.DurationSlice("latency", defaultReadLatency, "Simulated one-way network latency - may be a comma-separated list")
-	readKbps           = flags.IntSlice("kbps", defaultReadKbps, "Simulated network throughput (in kbps) - may be a comma-separated list")
-	readMTU            = flags.IntSlice("mtu", defaultReadMTU, "Simulated network MTU (Maximum Transmission Unit) - may be a comma-separated list")
-	maxConcurrentCalls = flags.IntSlice("maxConcurrentCalls", defaultMaxConcurrentCalls, "Number of concurrent RPCs during benchmarks")
-	readReqSizeBytes   = flags.IntSlice("reqSizeBytes", defaultReqSizeBytes, "Request size in bytes - may be a comma-separated list")
-	readRespSizeBytes  = flags.IntSlice("respSizeBytes", defaultRespSizeBytes, "Response size in bytes - may be a comma-separated list")
-	benchTime          = flag.Duration("benchtime", time.Second, "Configures the amount of time to run each benchmark")
-	memProfile         = flag.String("memProfile", "", "Enables memory profiling output to the filename provided.")
-	memProfileRate     = flag.Int("memProfileRate", 512*1024, "Configures the memory profiling rate. \n"+
+	readLatency           = flags.DurationSlice("latency", defaultReadLatency, "Simulated one-way network latency - may be a comma-separated list")
+	readKbps              = flags.IntSlice("kbps", defaultReadKbps, "Simulated network throughput (in kbps) - may be a comma-separated list")
+	readMTU               = flags.IntSlice("mtu", defaultReadMTU, "Simulated network MTU (Maximum Transmission Unit) - may be a comma-separated list")
+	maxConcurrentCalls    = flags.IntSlice("maxConcurrentCalls", defaultMaxConcurrentCalls, "Number of concurrent RPCs during benchmarks")
+	readReqSizeBytes      = flags.IntSlice("reqSizeBytes", nil, "Request size in bytes - may be a comma-separated list")
+	readRespSizeBytes     = flags.IntSlice("respSizeBytes", nil, "Response size in bytes - may be a comma-separated list")
+	reqPayloadCurveFiles  = flags.StringSlice("reqPayloadCurveFiles", nil, "comma-separated list of CSV files describing the shape a random distribution of request payload sizes")
+	respPayloadCurveFiles = flags.StringSlice("respPayloadCurveFiles", nil, "comma-separated list of CSV files describing the shape a random distribution of response payload sizes")
+	benchTime             = flag.Duration("benchtime", time.Second, "Configures the amount of time to run each benchmark")
+	memProfile            = flag.String("memProfile", "", "Enables memory profiling output to the filename provided.")
+	memProfileRate        = flag.Int("memProfileRate", 512*1024, "Configures the memory profiling rate. \n"+
 		"memProfile should be set before setting profile rate. To include every allocated block in the profile, "+
 		"set MemProfileRate to 1. To turn off profiling entirely, set MemProfileRate to 0. 512 * 1024 by default.")
 	cpuProfile          = flag.String("cpuProfile", "", "Enables CPU profiling output to the filename provided")
@@ -98,6 +100,8 @@ var (
 	useBufconn          = flag.Bool("bufconn", false, "Use in-memory connection instead of system network I/O")
 	enableKeepalive     = flag.Bool("enable_keepalive", false, "Enable client keepalive. \n"+
 		"Keepalive.Time is set to 10s, Keepalive.Timeout is set to 1s, Keepalive.PermitWithoutStream is set to true.")
+
+	logger = grpclog.Component("benchmark")
 )
 
 const (
@@ -143,8 +147,11 @@ var (
 		networkModeWAN:   latency.WAN,
 		networkLongHaul:  latency.Longhaul,
 	}
-	keepaliveTime    = 10 * time.Second // this is the minimum allowed
+	keepaliveTime    = 10 * time.Second
 	keepaliveTimeout = 1 * time.Second
+	// This is 0.8*keepaliveTime to prevent connection issues because of server
+	// keepalive enforcement.
+	keepaliveMinTime = 8 * time.Second
 )
 
 // runModes indicates the workloads to run. This is initialized with a call to
@@ -275,6 +282,16 @@ func makeClient(bf stats.Features) (testpb.BenchmarkServiceClient, func()) {
 		)
 	}
 	if bf.EnableKeepalive {
+		sopts = append(sopts,
+			grpc.KeepaliveParams(keepalive.ServerParameters{
+				Time:    keepaliveTime,
+				Timeout: keepaliveTimeout,
+			}),
+			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+				MinTime:             keepaliveMinTime,
+				PermitWithoutStream: true,
+			}),
+		)
 		opts = append(opts,
 			grpc.WithKeepaliveParams(keepalive.ClientParameters{
 				Time:                keepaliveTime,
@@ -299,7 +316,7 @@ func makeClient(bf stats.Features) (testpb.BenchmarkServiceClient, func()) {
 		var err error
 		lis, err = net.Listen("tcp", "localhost:0")
 		if err != nil {
-			grpclog.Fatalf("Failed to listen: %v", err)
+			logger.Fatalf("Failed to listen: %v", err)
 		}
 		opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
 			return nw.ContextDialer((&net.Dialer{}).DialContext)(ctx, "tcp", lis.Addr().String())
@@ -317,7 +334,15 @@ func makeClient(bf stats.Features) (testpb.BenchmarkServiceClient, func()) {
 func makeFuncUnary(bf stats.Features) (rpcCallFunc, rpcCleanupFunc) {
 	tc, cleanup := makeClient(bf)
 	return func(int) {
-		unaryCaller(tc, bf.ReqSizeBytes, bf.RespSizeBytes)
+		reqSizeBytes := bf.ReqSizeBytes
+		respSizeBytes := bf.RespSizeBytes
+		if bf.ReqPayloadCurve != nil {
+			reqSizeBytes = bf.ReqPayloadCurve.ChooseRandom()
+		}
+		if bf.RespPayloadCurve != nil {
+			respSizeBytes = bf.RespPayloadCurve.ChooseRandom()
+		}
+		unaryCaller(tc, reqSizeBytes, respSizeBytes)
 	}, cleanup
 }
 
@@ -328,13 +353,21 @@ func makeFuncStream(bf stats.Features) (rpcCallFunc, rpcCleanupFunc) {
 	for i := 0; i < bf.MaxConcurrentCalls; i++ {
 		stream, err := tc.StreamingCall(context.Background())
 		if err != nil {
-			grpclog.Fatalf("%v.StreamingCall(_) = _, %v", tc, err)
+			logger.Fatalf("%v.StreamingCall(_) = _, %v", tc, err)
 		}
 		streams[i] = stream
 	}
 
 	return func(pos int) {
-		streamCaller(streams[pos], bf.ReqSizeBytes, bf.RespSizeBytes)
+		reqSizeBytes := bf.ReqSizeBytes
+		respSizeBytes := bf.RespSizeBytes
+		if bf.ReqPayloadCurve != nil {
+			reqSizeBytes = bf.ReqPayloadCurve.ChooseRandom()
+		}
+		if bf.RespPayloadCurve != nil {
+			respSizeBytes = bf.RespPayloadCurve.ChooseRandom()
+		}
+		streamCaller(streams[pos], reqSizeBytes, respSizeBytes)
 	}, cleanup
 }
 
@@ -346,7 +379,7 @@ func makeFuncUnconstrainedStreamPreloaded(bf stats.Features) (rpcSendFunc, rpcRe
 		preparedMsg[i] = &grpc.PreparedMsg{}
 		err := preparedMsg[i].Encode(stream, req)
 		if err != nil {
-			grpclog.Fatalf("%v.Encode(%v, %v) = %v", preparedMsg[i], req, stream, err)
+			logger.Fatalf("%v.Encode(%v, %v) = %v", preparedMsg[i], req, stream, err)
 		}
 	}
 
@@ -374,7 +407,7 @@ func setupUnconstrainedStream(bf stats.Features) ([]testpb.BenchmarkService_Stre
 	for i := 0; i < bf.MaxConcurrentCalls; i++ {
 		stream, err := tc.UnconstrainedStreamingCall(context.Background())
 		if err != nil {
-			grpclog.Fatalf("%v.UnconstrainedStreamingCall(_) = _, %v", tc, err)
+			logger.Fatalf("%v.UnconstrainedStreamingCall(_) = _, %v", tc, err)
 		}
 		streams[i] = stream
 	}
@@ -393,13 +426,13 @@ func setupUnconstrainedStream(bf stats.Features) ([]testpb.BenchmarkService_Stre
 // request and response sizes.
 func unaryCaller(client testpb.BenchmarkServiceClient, reqSize, respSize int) {
 	if err := bm.DoUnaryCall(client, reqSize, respSize); err != nil {
-		grpclog.Fatalf("DoUnaryCall failed: %v", err)
+		logger.Fatalf("DoUnaryCall failed: %v", err)
 	}
 }
 
 func streamCaller(stream testpb.BenchmarkService_StreamingCallClient, reqSize, respSize int) {
 	if err := bm.DoStreamingRoundTrip(stream, reqSize, respSize); err != nil {
-		grpclog.Fatalf("DoStreamingRoundTrip failed: %v", err)
+		logger.Fatalf("DoStreamingRoundTrip failed: %v", err)
 	}
 }
 
@@ -462,6 +495,8 @@ type featureOpts struct {
 	maxConcurrentCalls []int
 	reqSizeBytes       []int
 	respSizeBytes      []int
+	reqPayloadCurves   []*stats.PayloadCurve
+	respPayloadCurves  []*stats.PayloadCurve
 	compModes          []string
 	enableChannelz     []bool
 	enablePreloader    []bool
@@ -491,6 +526,10 @@ func makeFeaturesNum(b *benchOpts) []int {
 			featuresNum[i] = len(b.features.reqSizeBytes)
 		case stats.RespSizeBytesIndex:
 			featuresNum[i] = len(b.features.respSizeBytes)
+		case stats.ReqPayloadCurveIndex:
+			featuresNum[i] = len(b.features.reqPayloadCurves)
+		case stats.RespPayloadCurveIndex:
+			featuresNum[i] = len(b.features.respPayloadCurves)
 		case stats.CompModesIndex:
 			featuresNum[i] = len(b.features.compModes)
 		case stats.EnableChannelzIndex:
@@ -544,7 +583,7 @@ func (b *benchOpts) generateFeatures(featuresNum []int) []stats.Features {
 		if curPos == nil {
 			curPos = make([]int, stats.MaxFeatureIndex)
 		}
-		result = append(result, stats.Features{
+		f := stats.Features{
 			// These features stay the same for each iteration.
 			NetworkMode:     b.networkMode,
 			UseBufConn:      b.useBufconn,
@@ -556,12 +595,21 @@ func (b *benchOpts) generateFeatures(featuresNum []int) []stats.Features {
 			Kbps:               b.features.readKbps[curPos[stats.ReadKbpsIndex]],
 			MTU:                b.features.readMTU[curPos[stats.ReadMTUIndex]],
 			MaxConcurrentCalls: b.features.maxConcurrentCalls[curPos[stats.MaxConcurrentCallsIndex]],
-			ReqSizeBytes:       b.features.reqSizeBytes[curPos[stats.ReqSizeBytesIndex]],
-			RespSizeBytes:      b.features.respSizeBytes[curPos[stats.RespSizeBytesIndex]],
 			ModeCompressor:     b.features.compModes[curPos[stats.CompModesIndex]],
 			EnableChannelz:     b.features.enableChannelz[curPos[stats.EnableChannelzIndex]],
 			EnablePreloader:    b.features.enablePreloader[curPos[stats.EnablePreloaderIndex]],
-		})
+		}
+		if len(b.features.reqPayloadCurves) == 0 {
+			f.ReqSizeBytes = b.features.reqSizeBytes[curPos[stats.ReqSizeBytesIndex]]
+		} else {
+			f.ReqPayloadCurve = b.features.reqPayloadCurves[curPos[stats.ReqPayloadCurveIndex]]
+		}
+		if len(b.features.respPayloadCurves) == 0 {
+			f.RespSizeBytes = b.features.respSizeBytes[curPos[stats.RespSizeBytesIndex]]
+		} else {
+			f.RespPayloadCurve = b.features.respPayloadCurves[curPos[stats.RespPayloadCurveIndex]]
+		}
+		result = append(result, f)
 		addOne(curPos, featuresNum)
 	}
 	return result
@@ -573,6 +621,9 @@ func (b *benchOpts) generateFeatures(featuresNum []int) []stats.Features {
 // 'featureIndex' enum.
 func addOne(features []int, featuresMaxPosition []int) {
 	for i := len(features) - 1; i >= 0; i-- {
+		if featuresMaxPosition[i] == 0 {
+			continue
+		}
 		features[i] = (features[i] + 1)
 		if features[i]/featuresMaxPosition[i] == 0 {
 			break
@@ -614,6 +665,41 @@ func processFlags() *benchOpts {
 			enableChannelz:     setToggleMode(*channelzOn),
 			enablePreloader:    setToggleMode(*preloaderMode),
 		},
+	}
+
+	if len(*reqPayloadCurveFiles) == 0 {
+		if len(opts.features.reqSizeBytes) == 0 {
+			opts.features.reqSizeBytes = defaultReqSizeBytes
+		}
+	} else {
+		if len(opts.features.reqSizeBytes) != 0 {
+			log.Fatalf("you may not specify -reqPayloadCurveFiles and -reqSizeBytes at the same time")
+		}
+		for _, file := range *reqPayloadCurveFiles {
+			pc, err := stats.NewPayloadCurve(file)
+			if err != nil {
+				log.Fatalf("cannot load payload curve file %s: %v", file, err)
+			}
+			opts.features.reqPayloadCurves = append(opts.features.reqPayloadCurves, pc)
+		}
+		opts.features.reqSizeBytes = nil
+	}
+	if len(*respPayloadCurveFiles) == 0 {
+		if len(opts.features.respSizeBytes) == 0 {
+			opts.features.respSizeBytes = defaultRespSizeBytes
+		}
+	} else {
+		if len(opts.features.respSizeBytes) != 0 {
+			log.Fatalf("you may not specify -respPayloadCurveFiles and -respSizeBytes at the same time")
+		}
+		for _, file := range *respPayloadCurveFiles {
+			pc, err := stats.NewPayloadCurve(file)
+			if err != nil {
+				log.Fatalf("cannot load payload curve file %s: %v", file, err)
+			}
+			opts.features.respPayloadCurves = append(opts.features.respPayloadCurves, pc)
+		}
+		opts.features.respSizeBytes = nil
 	}
 
 	// Re-write latency, kpbs and mtu if network mode is set.

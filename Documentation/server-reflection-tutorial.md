@@ -28,7 +28,7 @@ make the following changes:
 @@ -61,6 +62,8 @@ func main() {
         }
         s := grpc.NewServer()
-        pb.RegisterGreeterServer(s, &server{})
+        pb.RegisterGreeterService(s, &pb.GreeterService{SayHello: sayHello})
 +       // Register reflection service on gRPC server.
 +       reflection.Register(s)
         if err := s.Serve(lis); err != nil {
@@ -51,6 +51,7 @@ To build gRPC CLI:
 ```sh
 git clone https://github.com/grpc/grpc
 cd grpc
+git submodule update --init
 make grpc_cli
 cd bins/opt # grpc_cli is in directory bins/opt/
 ```
